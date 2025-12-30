@@ -7,7 +7,11 @@ import { generateCarouselImage, parseRawList } from './services/geminiService';
 import { STYLES, AI_INSTRUCTION_MODEL } from './constants';
 
 const App: React.FC = () => {
-  const [hasKey, setHasKey] = useState(false);
+  // Inicializa hasKey como true se a variável de ambiente existir, evitando a tela de bloqueio
+  const [hasKey, setHasKey] = useState<boolean>(() => {
+    return !!process.env.API_KEY && process.env.API_KEY !== "";
+  });
+  
   const [loadingKey, setLoadingKey] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   
@@ -24,22 +28,25 @@ const App: React.FC = () => {
   });
   const [showSettings, setShowSettings] = useState(false);
 
-  // Aumentado para permitir geração simultânea real
   const MAX_CONCURRENT = 10; 
 
   useEffect(() => {
     const checkKey = async () => {
-      if (typeof window !== 'undefined' && window.aistudio?.hasSelectedApiKey) {
+      // Se já temos a chave pela Env Var, não precisamos fazer nada
+      if (hasKey) return;
+
+      const isAiStudioEnv = typeof window !== 'undefined' && !!window.aistudio;
+      if (isAiStudioEnv) {
         try {
-          const valid = await window.aistudio.hasSelectedApiKey();
-          setHasKey(valid);
+          const valid = await window.aistudio!.hasSelectedApiKey();
+          if (valid) setHasKey(true);
         } catch(e) {
-          console.error("Erro verificando chave", e);
+          console.error("Erro na verificação automática", e);
         }
       }
     };
     checkKey();
-  }, []);
+  }, [hasKey]);
 
   const handleSelectKey = async () => {
     setLoadingKey(true);
@@ -48,9 +55,11 @@ const App: React.FC = () => {
       if (typeof window !== 'undefined' && window.aistudio) {
         await window.aistudio.openSelectKey();
         setHasKey(true);
+      } else {
+        setAuthError("API_KEY não detectada. No Vercel, configure a variável 'API_KEY' nas Settings > Environment Variables e faça um novo deploy.");
       }
     } catch (e) {
-      setAuthError("Falha ao selecionar chave.");
+      setAuthError("Falha ao tentar conectar com o Google Cloud.");
     } finally {
       setLoadingKey(false);
     }
@@ -58,37 +67,26 @@ const App: React.FC = () => {
 
   const handleAuthError = (error: any) => {
     const msg = error?.message || String(error);
-    if (msg.includes("UNAUTHENTICATED") || msg.includes("401") || msg.includes("403")) {
+    if (msg.includes("UNAUTHENTICATED") || msg.includes("401") || msg.includes("403") || msg.includes("not found")) {
       setHasKey(false);
-      setAuthError("Sua conexão falhou. Verifique o faturamento.");
+      setAuthError("Sua chave de API parece inválida ou o faturamento não está ativo no Google Cloud Console.");
       return true;
     }
     return false;
   };
 
-  // Efeito modificado para disparar todos os itens pendentes em paralelo
   useEffect(() => {
     if (!carouselData) return;
-    
-    // Filtra todos os itens que ainda não começaram
     const pendingItems = carouselData.items.filter(i => i.status === 'pending');
     if (pendingItems.length === 0) return;
-
-    // Calcula quantos novos processos podemos iniciar simultaneamente
     const availableSlots = MAX_CONCURRENT - generatingCount;
     if (availableSlots <= 0) return;
-
-    // Pega o lote de itens para iniciar agora
     const itemsToStart = pendingItems.slice(0, availableSlots);
-    
-    // Dispara todos em paralelo
     itemsToStart.forEach(item => processItem(item));
   }, [carouselData, generatingCount]);
 
   const processItem = async (item: CarouselItem) => {
     setGeneratingCount(c => c + 1);
-    
-    // Marca o item como gerando no estado global
     setCarouselData(prev => {
       if (!prev) return null;
       return {
@@ -98,9 +96,7 @@ const App: React.FC = () => {
     });
 
     try {
-      // Gera a imagem usando a config específica salva no item
       const imageUrl = await generateCarouselImage(item, item.config);
-      
       setCarouselData(prev => {
         if (!prev) return null;
         return {
@@ -129,12 +125,10 @@ const App: React.FC = () => {
     setAuthError(null);
     try {
       const parsed = parseRawList(inputValue);
-      
-      // Enriquecer os itens novos com a configuração atual (aspecto, estilo, etc)
       const enrichedItems: CarouselItem[] = parsed.items.map(item => ({
         ...item,
         status: 'pending',
-        config: { ...imageConfig } // Congela a config atual para este item individual
+        config: { ...imageConfig } 
       } as CarouselItem));
 
       setCarouselData(prev => {
@@ -150,10 +144,7 @@ const App: React.FC = () => {
           items: [...prev.items, ...enrichedItems]
         };
       });
-
-      // Limpar o input para permitir novas adições rápidas
       setInputValue('');
-      
     } catch (e: any) {
       alert(e.message);
     } finally {
@@ -206,6 +197,7 @@ const App: React.FC = () => {
     alert("Instrução copiada!");
   };
 
+  // Renderiza a tela de bloqueio apenas se NÃO houver chave detectada
   if (!hasKey) {
     return <ApiKeyModal onSelect={handleSelectKey} isLoading={loadingKey} error={authError} />;
   }
@@ -242,7 +234,7 @@ const App: React.FC = () => {
               Criação Simultânea <br/>por Roteiro
             </h2>
             <p className="text-gray-400 max-w-xl mx-auto text-lg">
-              Agora o sistema gera todas as imagens de uma vez. Adicione seus blocos e veja a mágica acontecer em paralelo.
+              O sistema gera todas as imagens de uma vez. Adicione seus blocos e veja a mágica acontecer em paralelo.
             </p>
           </div>
         )}
