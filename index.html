@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="pt-BR" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Criador de Ilustrações em lote</title>
+    
+    <!-- Configure Tailwind BEFORE loading the library -->
+    <script>
+      tailwind = {
+        config: {
+          darkMode: 'class',
+          theme: {
+            extend: {
+              colors: {
+                brand: {
+                  orange: '#FF6B00',
+                  blue: '#0085FF',
+                  dark: '#0F1115',
+                  card: '#1A1D24'
+                }
+              }
+            }
+          }
+        }
+      }
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+      body {
+        font-family: 'Inter', sans-serif;
+        background-color: #0F1115;
+        color: #ffffff;
+        margin: 0;
+        min-height: 100vh;
+      }
+      /* Custom Scrollbar */
+      ::-webkit-scrollbar {
+        width: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: #1A1D24; 
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #333; 
+        border-radius: 4px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #555; 
+      }
+      .loading-placeholder {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        color: #666;
+        font-family: monospace;
+      }
+    </style>
+    <script type="importmap">
+    {
+      "imports": {
+        "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+        "react/": "https://aistudiocdn.com/react@^19.2.0/",
+        "react": "https://aistudiocdn.com/react@^19.2.0",
+        "@google/genai": "https://aistudiocdn.com/@google/genai@^1.30.0"
+      }
+    }
+    </script>
+  </head>
+  <body>
+    <div id="root">
+        <div class="loading-placeholder">
+            Carregando Aplicação...
+        </div>
+    </div>
+    <script type="module" src="./index.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,5 @@
+{
+  "name": "Criador de Ilustrações em lote",
+  "description": "Gera ilustrações de carrossel em série, profissionais, em estilos realistas e modernos usando o Gemini 3 Pro.",
+  "requestFramePermissions": []
+}
