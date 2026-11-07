@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/gerar-imagem.ts": {
+      "maxDuration": 120
+    }
+  }
+}

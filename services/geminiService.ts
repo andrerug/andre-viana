@@ -1,15 +1,28 @@
 
-import { GoogleGenAI } from "@google/genai";
 import { STYLES } from "../constants";
-import { CarouselItem, GeneratedCarousel, ImageConfig } from "../types";
+import { CarouselItem, ImageConfig } from "../types";
 
-const getAI = () => {
-  const apiKey = process.env.API_KEY;
-  if (!apiKey || apiKey.trim() === "") {
-    throw new Error("UNAUTHENTICATED: Chave de API não configurada.");
-  }
-  return new GoogleGenAI({ apiKey });
+// A chave do Gemini fica no servidor (api/gerar-imagem.ts).
+// O navegador só guarda a senha de acesso ao app.
+const CHAVE_SENHA = "senha-app";
+
+export const getSenha = (): string => {
+  try { return localStorage.getItem(CHAVE_SENHA) || ""; } catch { return ""; }
 };
+export const setSenha = (senha: string) => {
+  try { localStorage.setItem(CHAVE_SENHA, senha); } catch { /* navegador sem armazenamento */ }
+};
+export const limparSenha = () => {
+  try { localStorage.removeItem(CHAVE_SENHA); } catch { /* idem */ }
+};
+
+export class ErroServidor extends Error {
+  codigo: string;
+  constructor(codigo: string, mensagem: string) {
+    super(mensagem);
+    this.codigo = codigo;
+  }
+}
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -56,76 +69,43 @@ export const parseRawList = (text: string): { items: Partial<CarouselItem>[] } =
 };
 
 export const generateCarouselImage = async (item: CarouselItem, config: ImageConfig): Promise<string> => {
-  const ai = getAI();
-  
   const styleConfig = STYLES[config.style] || STYLES['3d-render'];
   const basePrompt = item.prompt ? item.prompt.trim() : "";
   const suffix = styleConfig.suffix ? styleConfig.suffix.trim() : "";
   const fullPrompt = suffix ? `${basePrompt}. ${suffix}` : basePrompt;
 
-  const isFlash = config.resolution === 'Flash';
-  const model = isFlash ? 'gemini-2.5-flash-image' : 'gemini-3-pro-image-preview';
-
-  let apiAspectRatio: string = config.aspectRatio;
-  if (config.aspectRatio === "4:5") {
-    apiAspectRatio = "3:4"; 
-  }
-
-  const imageConfig: any = {
-    aspectRatio: apiAspectRatio,
-  };
-
-  if (!isFlash) {
-    imageConfig.imageSize = config.resolution;
-  }
+  // O formato 4:5 não existe na API; usa 3:4, o mais próximo.
+  const aspectRatio = config.aspectRatio === "4:5" ? "3:4" : config.aspectRatio;
 
   let attempt = 0;
   const maxRetries = 2;
 
   while (attempt <= maxRetries) {
+    let resposta: Response;
     try {
-      const response = await ai.models.generateContent({
-        model,
-        contents: {
-          parts: [{ text: fullPrompt }]
-        },
-        config: {
-          imageConfig
-        }
+      resposta = await fetch("/api/gerar-imagem", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-senha-app": getSenha() },
+        body: JSON.stringify({ prompt: fullPrompt, aspectRatio, resolution: config.resolution }),
       });
-
-      if (!response.candidates || response.candidates.length === 0) {
-        throw new Error("A API não retornou candidatos.");
-      }
-
-      const candidate = response.candidates[0];
-      
-      if (candidate.content && candidate.content.parts) {
-        for (const part of candidate.content.parts) {
-          if (part.inlineData && part.inlineData.data) {
-            return `data:image/png;base64,${part.inlineData.data}`;
-          }
-        }
-      }
-
-      if (candidate.finishReason === 'SAFETY') {
-        throw new Error("Segurança: Prompt bloqueado.");
-      }
-
-      throw new Error("Nenhum dado de imagem recebido.");
-
-    } catch (error: any) {
-      console.error(`Attempt ${attempt} failed:`, error);
-      const msg = error.message || "";
-      const isRetryable = msg.includes("503") || msg.includes("overloaded") || msg.includes("UNAVAILABLE");
-      
-      if (isRetryable && attempt < maxRetries) {
-        attempt++;
-        await delay(2000 * Math.pow(2, attempt));
-        continue;
-      }
-      throw error;
+    } catch {
+      throw new ErroServidor("REDE", "Sem conexão com o servidor. Verifique a internet.");
     }
+
+    let dados: any = null;
+    try { dados = await resposta.json(); } catch { /* resposta sem JSON */ }
+
+    if (resposta.ok && dados?.imagem) return dados.imagem;
+
+    const codigo = dados?.erro || `HTTP_${resposta.status}`;
+    const mensagem = dados?.mensagem || `Falha no servidor (${resposta.status}).`;
+    const repetir = (codigo === "OCUPADO" || resposta.status === 503 || resposta.status === 504) && attempt < maxRetries;
+    if (repetir) {
+      attempt++;
+      await delay(2000 * Math.pow(2, attempt));
+      continue;
+    }
+    throw new ErroServidor(codigo, mensagem);
   }
-  throw new Error("Falha persistente na geração.");
+  throw new ErroServidor("FALHA", "Falha persistente na geração.");
 };

@@ -3,16 +3,12 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { ApiKeyModal } from './components/ApiKeyModal';
 import { CardDisplay } from './components/CardDisplay';
 import { CarouselItem, GeneratedCarousel, ImageConfig, ImageStyleId, AspectRatioType } from './types';
-import { generateCarouselImage, parseRawList } from './services/geminiService';
+import { generateCarouselImage, parseRawList, getSenha, setSenha, limparSenha, ErroServidor } from './services/geminiService';
 import { STYLES, AI_INSTRUCTION_MODEL } from './constants';
 
 const App: React.FC = () => {
-  // Inicializa hasKey como true se a variável de ambiente existir, evitando a tela de bloqueio
-  const [hasKey, setHasKey] = useState<boolean>(() => {
-    return !!process.env.API_KEY && process.env.API_KEY !== "";
-  });
-  
-  const [loadingKey, setLoadingKey] = useState(false);
+  // Libera o app se já houver senha guardada neste navegador
+  const [hasKey, setHasKey] = useState<boolean>(() => getSenha() !== "");
   const [authError, setAuthError] = useState<string | null>(null);
   
   const [inputValue, setInputValue] = useState('');
@@ -30,46 +26,18 @@ const App: React.FC = () => {
 
   const MAX_CONCURRENT = 10; 
 
-  useEffect(() => {
-    const checkKey = async () => {
-      // Se já temos a chave pela Env Var, não precisamos fazer nada
-      if (hasKey) return;
-
-      const isAiStudioEnv = typeof window !== 'undefined' && !!window.aistudio;
-      if (isAiStudioEnv) {
-        try {
-          const valid = await window.aistudio!.hasSelectedApiKey();
-          if (valid) setHasKey(true);
-        } catch(e) {
-          console.error("Erro na verificação automática", e);
-        }
-      }
-    };
-    checkKey();
-  }, [hasKey]);
-
-  const handleSelectKey = async () => {
-    setLoadingKey(true);
+  const handleSenha = (senha: string) => {
+    setSenha(senha);
     setAuthError(null);
-    try {
-      if (typeof window !== 'undefined' && window.aistudio) {
-        await window.aistudio.openSelectKey();
-        setHasKey(true);
-      } else {
-        setAuthError("API_KEY não detectada. No Vercel, configure a variável 'API_KEY' nas Settings > Environment Variables e faça um novo deploy.");
-      }
-    } catch (e) {
-      setAuthError("Falha ao tentar conectar com o Google Cloud.");
-    } finally {
-      setLoadingKey(false);
-    }
+    setHasKey(true);
   };
 
+  // Senha errada: volta para a tela de acesso. Outros erros aparecem no próprio card.
   const handleAuthError = (error: any) => {
-    const msg = error?.message || String(error);
-    if (msg.includes("UNAUTHENTICATED") || msg.includes("401") || msg.includes("403") || msg.includes("not found")) {
+    if (error instanceof ErroServidor && error.codigo === "SENHA") {
+      limparSenha();
       setHasKey(false);
-      setAuthError("Sua chave de API parece inválida ou o faturamento não está ativo no Google Cloud Console.");
+      setAuthError(error.message);
       return true;
     }
     return false;
@@ -199,7 +167,7 @@ const App: React.FC = () => {
 
   // Renderiza a tela de bloqueio apenas se NÃO houver chave detectada
   if (!hasKey) {
-    return <ApiKeyModal onSelect={handleSelectKey} isLoading={loadingKey} error={authError} />;
+    return <ApiKeyModal onSubmit={handleSenha} error={authError} />;
   }
 
   return (
