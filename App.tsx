@@ -6,6 +6,7 @@ import { generateCarouselImage, parseRawList, getSenha, setSenha, limparSenha, E
 import { STYLES, AI_INSTRUCTION_MODEL } from './constants';
 import { criarZip, dataUrlParaBytes, extensaoDoMime } from './services/zip';
 import { salvarLote, carregarLote } from './services/armazenamento';
+import { PRECO_USD, textoCusto, custoDeItens } from './services/custo';
 
 // Paralelismo: começa em 4 e cai pela metade quando o Google limita o uso.
 const PARALELO_INICIAL = 4;
@@ -21,9 +22,9 @@ const proporcoes: { id: AspectRatioType; label: string; w: number; h: number }[]
 ];
 
 const qualidades: { id: ImageConfig['resolution']; label: string; descricao: string }[] = [
-  { id: 'Flash', label: 'Rápida', descricao: 'Flash, mais barata' },
-  { id: '1K', label: 'Pro 1K', descricao: 'Padrão' },
-  { id: '2K', label: 'Pro 2K', descricao: 'Mais detalhe' },
+  { id: 'Flash', label: 'Rápida', descricao: 'US$ 0.04 por imagem' },
+  { id: '1K', label: 'Pro 1K', descricao: 'US$ 0.13 por imagem' },
+  { id: '2K', label: 'Pro 2K', descricao: 'US$ 0.13, mais detalhe' },
 ];
 
 const lerJSON = <T,>(chave: string, padrao: T): T => {
@@ -417,9 +418,17 @@ const App: React.FC = () => {
                 {estiloAtual.label} · {proporcoes.find(p => p.id === imageConfig.aspectRatio)?.label} · {qualidades.find(q => q.id === imageConfig.resolution)?.label}
                 {imageConfig.referencia ? ' · com referência' : ''}. Ctrl + Enter também gera.
               </p>
-              <button type="button" onClick={handleMainAction} disabled={!blocosNoRoteiro} className="av-btn av-btn--primario w-full sm:w-auto">
-                {blocosNoRoteiro ? `Gerar ${blocosNoRoteiro} ${blocosNoRoteiro === 1 ? 'ilustração' : 'ilustrações'}` : 'Gerar ilustrações'}
-              </button>
+              <div className="flex items-center gap-3 w-full sm:w-auto">
+                {blocosNoRoteiro > 0 && (
+                  <span className="text-sm font-semibold text-texto-suave whitespace-nowrap cursor-help" style={{ fontVariantNumeric: 'tabular-nums' }}
+                    title={textoCusto(blocosNoRoteiro, PRECO_USD[imageConfig.resolution]).detalhe}>
+                    {textoCusto(blocosNoRoteiro, PRECO_USD[imageConfig.resolution]).curto}
+                  </span>
+                )}
+                <button type="button" onClick={handleMainAction} disabled={!blocosNoRoteiro} className="av-btn av-btn--primario flex-1 sm:flex-none">
+                  {blocosNoRoteiro ? `Gerar ${blocosNoRoteiro} ${blocosNoRoteiro === 1 ? 'ilustração' : 'ilustrações'}` : 'Gerar ilustrações'}
+                </button>
+              </div>
             </div>
           </section>
 
@@ -446,7 +455,7 @@ const App: React.FC = () => {
                 </div>
                 <div className="flex flex-wrap gap-2">
                   {ativo && <button type="button" onClick={cancelarTudo} className="av-btn av-btn--secundario av-btn--pequeno">Parar o lote</button>}
-                  {!ativo && (contagem.falhas + contagem.paradas > 0) && <button type="button" onClick={repetirFalhas} className="av-btn av-btn--secundario av-btn--pequeno">Repetir as {contagem.falhas + contagem.paradas} que faltam</button>}
+                  {!ativo && (contagem.falhas + contagem.paradas > 0) && <button type="button" onClick={repetirFalhas} className="av-btn av-btn--secundario av-btn--pequeno">Repetir as {contagem.falhas + contagem.paradas} que faltam <span className="font-semibold opacity-80">≈ US$ {custoDeItens(carouselData.items.filter(i => i.status === 'error' || i.status === 'cancelled')).toFixed(2)}</span></button>}
                   <button type="button" onClick={baixarZip} disabled={!contagem.prontas || zipando} className="av-btn av-btn--primario av-btn--pequeno">
                     {zipando ? 'Preparando o .zip…' : `Baixar ${contagem.prontas} em .zip`}
                   </button>
