@@ -8,10 +8,12 @@ import { createHash, timingSafeEqual } from "node:crypto";
 const MODELO_FLASH = "gemini-2.5-flash-image";
 const MODELO_PRO = "gemini-3-pro-image";
 
-const PROPORCOES = new Set(["1:1", "3:4", "4:3", "9:16", "16:9"]);
+const PROPORCOES = new Set(["1:1", "3:4", "4:3", "4:5", "9:16", "16:9"]);
 const RESOLUCOES = new Set(["Flash", "1K", "2K"]);
 const MAX_PROMPT = 4000;
-const MAX_CORPO = 20_000; // bytes
+const MAX_CORPO = 20_000; // bytes, pedido só com texto
+const MAX_CORPO_COM_REFERENCIA = 3_000_000; // bytes, com imagem de referência (o navegador reduz para 1024 px)
+const REF_MIMES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const MAX_RESPOSTA = 4_200_000; // limite de resposta das funções da Vercel é 4,5 MB
 
 function json(status: number, corpo: Record<string, unknown>): Response {
@@ -41,7 +43,7 @@ export async function POST(request: Request): Promise<Response> {
   if (!senhaConfere(senha, senhaApp)) return erro(401, "SENHA", "Senha de acesso incorreta.");
 
   const tamanho = Number(request.headers.get("content-length") || 0);
-  if (tamanho > MAX_CORPO) return erro(413, "ENTRADA", "Pedido grande demais.");
+  if (tamanho > MAX_CORPO_COM_REFERENCIA) return erro(413, "ENTRADA", "Pedido grande demais. Use uma imagem de referência menor.");
 
   let dados: any;
   try {
@@ -58,17 +60,44 @@ export async function POST(request: Request): Promise<Response> {
   if (!PROPORCOES.has(proporcao)) return erro(400, "ENTRADA", "Proporção inválida.");
   if (!RESOLUCOES.has(resolucao)) return erro(400, "ENTRADA", "Qualidade inválida.");
 
+  // Imagem de referência opcional: data URL de JPEG/PNG/WebP
+  let referencia: { mimeType: string; data: string } | null = null;
+  if (dados?.referencia != null) {
+    const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(dados.referencia));
+    if (!m || !REF_MIMES.has(m[1])) return erro(400, "ENTRADA", "Imagem de referência inválida.");
+    if (m[2].length > MAX_CORPO_COM_REFERENCIA) return erro(413, "ENTRADA", "Imagem de referência grande demais.");
+    referencia = { mimeType: m[1], data: m[2] };
+  } else if (tamanho > MAX_CORPO) {
+    return erro(413, "ENTRADA", "Pedido grande demais.");
+  }
+
   const isFlash = resolucao === "Flash";
-  const imageConfig: Record<string, string> = { aspectRatio: proporcao };
-  if (!isFlash) imageConfig.imageSize = resolucao;
+  const montarConfig = (aspectRatio: string) => {
+    const imageConfig: Record<string, string> = { aspectRatio };
+    if (!isFlash) imageConfig.imageSize = resolucao;
+    return imageConfig;
+  };
+  const partes: any[] = referencia
+    ? [{ inlineData: referencia }, { text: `${prompt}
+
+Use the attached image as the visual reference: keep its style, colors and characters consistent.` }]
+    : [{ text: prompt }];
 
   try {
     const ai = new GoogleGenAI({ apiKey: chave });
-    const resposta = await ai.models.generateContent({
+    const gerar = (aspectRatio: string) => ai.models.generateContent({
       model: isFlash ? MODELO_FLASH : MODELO_PRO,
-      contents: { parts: [{ text: prompt }] },
-      config: { imageConfig },
+      contents: { parts: partes },
+      config: { imageConfig: montarConfig(aspectRatio) },
     });
+    let resposta;
+    try {
+      resposta = await gerar(proporcao);
+    } catch (e: any) {
+      // Se o modelo não aceitar 4:5, usa 3:4 (o mais próximo) em vez de falhar.
+      if (proporcao === "4:5" && /aspect|INVALID_ARGUMENT|400/i.test(String(e?.message || e))) resposta = await gerar("3:4");
+      else throw e;
+    }
 
     const candidato = resposta.candidates?.[0];
     for (const parte of candidato?.content?.parts || []) {

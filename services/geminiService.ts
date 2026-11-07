@@ -24,8 +24,6 @@ export class ErroServidor extends Error {
   }
 }
 
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
 export const parseRawList = (text: string): { items: Partial<CarouselItem>[] } => {
   let chunks: string[] = [];
   if (text.includes('---')) {
@@ -68,27 +66,37 @@ export const parseRawList = (text: string): { items: Partial<CarouselItem>[] } =
   return { items };
 };
 
-export const generateCarouselImage = async (item: CarouselItem, config: ImageConfig): Promise<string> => {
+const esperar = (ms: number, sinal?: AbortSignal) =>
+  new Promise<void>((ok, falha) => {
+    const t = setTimeout(ok, ms);
+    sinal?.addEventListener('abort', () => { clearTimeout(t); falha(new ErroServidor("CANCELADO", "Geração cancelada.")); }, { once: true });
+  });
+
+export const generateCarouselImage = async (item: CarouselItem, config: ImageConfig, sinal?: AbortSignal): Promise<string> => {
   const styleConfig = STYLES[config.style] || STYLES['3d-render'];
   const basePrompt = item.prompt ? item.prompt.trim() : "";
   const suffix = styleConfig.suffix ? styleConfig.suffix.trim() : "";
   const fullPrompt = suffix ? `${basePrompt}. ${suffix}` : basePrompt;
 
-  // O formato 4:5 não existe na API; usa 3:4, o mais próximo.
-  const aspectRatio = config.aspectRatio === "4:5" ? "3:4" : config.aspectRatio;
+  // 4:5 vai direto; se o modelo recusar, o servidor tenta 3:4 sozinho.
+  const aspectRatio = config.aspectRatio;
+  const referencia = config.referencia || undefined;
 
   let attempt = 0;
   const maxRetries = 2;
 
   while (attempt <= maxRetries) {
+    if (sinal?.aborted) throw new ErroServidor("CANCELADO", "Geração cancelada.");
     let resposta: Response;
     try {
       resposta = await fetch("/api/gerar-imagem", {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-senha-app": getSenha() },
-        body: JSON.stringify({ prompt: fullPrompt, aspectRatio, resolution: config.resolution }),
+        body: JSON.stringify({ prompt: fullPrompt, aspectRatio, resolution: config.resolution, referencia }),
+        signal: sinal,
       });
-    } catch {
+    } catch (e: any) {
+      if (e?.name === "AbortError" || sinal?.aborted) throw new ErroServidor("CANCELADO", "Geração cancelada.");
       throw new ErroServidor("REDE", "Sem conexão com o servidor. Verifique a internet.");
     }
 
@@ -102,10 +110,29 @@ export const generateCarouselImage = async (item: CarouselItem, config: ImageCon
     const repetir = (codigo === "OCUPADO" || resposta.status === 503 || resposta.status === 504) && attempt < maxRetries;
     if (repetir) {
       attempt++;
-      await delay(2000 * Math.pow(2, attempt));
+      await esperar(2000 * Math.pow(2, attempt), sinal);
       continue;
     }
     throw new ErroServidor(codigo, mensagem);
   }
   throw new ErroServidor("FALHA", "Falha persistente na geração.");
 };
+
+// Reduz a imagem de referência no navegador (lado maior 1024 px, JPEG) para caber no limite do servidor.
+export const prepararReferencia = (arquivo: File): Promise<string> =>
+  new Promise((ok, falha) => {
+    if (!/^image\/(png|jpeg|webp)$/.test(arquivo.type)) return falha(new Error("Use uma imagem PNG, JPG ou WebP."));
+    const url = URL.createObjectURL(arquivo);
+    const img = new Image();
+    img.onload = () => {
+      const escala = Math.min(1, 1024 / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.width * escala);
+      c.height = Math.round(img.height * escala);
+      c.getContext("2d")!.drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      ok(c.toDataURL("image/jpeg", 0.85));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); falha(new Error("Não foi possível ler essa imagem.")); };
+    img.src = url;
+  });

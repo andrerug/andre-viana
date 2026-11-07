@@ -6,6 +6,14 @@
 
 Gera várias imagens de uma vez a partir de um roteiro (`**P1** ... --- **P2** ...`), com o Gemini.
 
+## O que o app faz
+
+- Configurações do lote sempre visíveis: 16 estilos (5 para estudo), com miniatura de cada um; proporção (4:5, 1:1, 9:16, 16:9); qualidade; imagem de referência opcional.
+- Gera 4 imagens por vez e desacelera sozinho se o Google limitar o uso. Dá para parar o lote no meio.
+- Cada card: baixar, editar a descrição e gerar de novo, variação, remover.
+- Baixa tudo num .zip. O lote fica salvo no navegador (um F5 não apaga).
+- Visual do design system André Viana (`public/av/`), com tema escuro e claro.
+
 ## Como funciona a segurança
 
 - A chave do Gemini (`GEMINI_API_KEY`) fica **só no servidor**, na função `api/gerar-imagem.ts` da Vercel. Ela não vai para o código do navegador.
@@ -22,7 +30,7 @@ Depois de mudar uma variável, faça um novo deploy (Deployments > ⋯ > Redeplo
 
 ## Modelos
 
-- Flash: `gemini-2.5-flash-image`
+- Flash: `gemini-2.5-flash-image` (legado; ver proposta de troca para `gemini-3.1-flash-image`)
 - Pro 1K/2K: `gemini-3-pro-image`
 
 ## Rodar localmente

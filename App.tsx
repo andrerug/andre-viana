@@ -1,30 +1,104 @@
-
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { ApiKeyModal } from './components/ApiKeyModal';
 import { CardDisplay } from './components/CardDisplay';
 import { CarouselItem, GeneratedCarousel, ImageConfig, ImageStyleId, AspectRatioType } from './types';
-import { generateCarouselImage, parseRawList, getSenha, setSenha, limparSenha, ErroServidor } from './services/geminiService';
+import { generateCarouselImage, parseRawList, getSenha, setSenha, limparSenha, ErroServidor, prepararReferencia } from './services/geminiService';
 import { STYLES, AI_INSTRUCTION_MODEL } from './constants';
+import { criarZip, dataUrlParaBytes, extensaoDoMime } from './services/zip';
+import { salvarLote, carregarLote } from './services/armazenamento';
+
+// Paralelismo: começa em 4 e cai pela metade quando o Google limita o uso.
+const PARALELO_INICIAL = 4;
+const PAUSA_LIMITE_MS = 20_000;
+const CHAVE_CONFIG = 'config-lote';
+const CHAVE_TEMA = 'tema';
+
+const proporcoes: { id: AspectRatioType; label: string; w: number; h: number }[] = [
+  { id: '4:5', label: 'Retrato 4:5 (feed)', w: 4, h: 5 },
+  { id: '1:1', label: 'Quadrado 1:1', w: 1, h: 1 },
+  { id: '9:16', label: 'Stories 9:16', w: 9, h: 16 },
+  { id: '16:9', label: 'Paisagem 16:9', w: 16, h: 9 },
+];
+
+const qualidades: { id: ImageConfig['resolution']; label: string; descricao: string }[] = [
+  { id: 'Flash', label: 'Rápida', descricao: 'Flash, mais barata' },
+  { id: '1K', label: 'Pro 1K', descricao: 'Padrão' },
+  { id: '2K', label: 'Pro 2K', descricao: 'Mais detalhe' },
+];
+
+const lerJSON = <T,>(chave: string, padrao: T): T => {
+  try { const v = localStorage.getItem(chave); return v ? { ...padrao, ...JSON.parse(v) } : padrao; } catch { return padrao; }
+};
+const gravar = (chave: string, valor: unknown) => { try { localStorage.setItem(chave, typeof valor === 'string' ? valor : JSON.stringify(valor)); } catch { /* sem armazenamento */ } };
 
 const App: React.FC = () => {
   // Libera o app se já houver senha guardada neste navegador
   const [hasKey, setHasKey] = useState<boolean>(() => getSenha() !== "");
   const [authError, setAuthError] = useState<string | null>(null);
-  
-  const [inputValue, setInputValue] = useState('');
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [carouselData, setCarouselData] = useState<GeneratedCarousel | null>(null);
-  const [generatingCount, setGeneratingCount] = useState(0);
-  const [showModelModal, setShowModelModal] = useState(false);
-  
-  const [imageConfig, setImageConfig] = useState<ImageConfig>({
-    aspectRatio: "4:5", 
-    resolution: "1K",
-    style: "3d-render"
-  });
-  const [showSettings, setShowSettings] = useState(false);
 
-  const MAX_CONCURRENT = 10; 
+  const [inputValue, setInputValue] = useState('');
+  const [erroRoteiro, setErroRoteiro] = useState<string | null>(null);
+  const [carouselData, setCarouselData] = useState<GeneratedCarousel | null>(null);
+  const [carregado, setCarregado] = useState(false);
+  const [interrompidas, setInterrompidas] = useState(0);
+  const [showModelModal, setShowModelModal] = useState(false);
+  const [aviso, setAviso] = useState<string | null>(null);
+  const [erroRef, setErroRef] = useState<string | null>(null);
+  const [zipando, setZipando] = useState(false);
+
+  const [imageConfig, setImageConfig] = useState<ImageConfig>(() => {
+    const c = lerJSON<ImageConfig>(CHAVE_CONFIG, { aspectRatio: '4:5', resolution: '1K', style: '3d-render' });
+    return { ...c, referencia: undefined, style: (STYLES[c.style] ? c.style : '3d-render') as ImageStyleId };
+  });
+  const [tema, setTema] = useState<string>(() => document.documentElement.dataset.theme || 'dark');
+
+  // Fila
+  // Limite e pausa em refs: a fila precisa do valor na hora, não no próximo desenho da tela.
+  const limiteParalelo = useRef(PARALELO_INICIAL);
+  const pausadoAte = useRef(0);
+  const timerPausa = useRef<number | null>(null);
+  const controladores = useRef(new Map<string, AbortController>());
+  const emAndamento = useRef(new Set<string>());
+  const [, forcar] = useState(0);
+
+  // ---- Tema
+  useEffect(() => {
+    document.documentElement.dataset.theme = tema;
+    gravar(CHAVE_TEMA, tema);
+  }, [tema]);
+
+  // ---- Configuração lembrada entre visitas (sem a imagem de referência)
+  useEffect(() => {
+    const { referencia, ...resto } = imageConfig;
+    gravar(CHAVE_CONFIG, resto);
+  }, [imageConfig]);
+
+  // ---- Recupera o lote salvo neste navegador
+  useEffect(() => {
+    carregarLote().then(lote => {
+      if (lote && lote.items?.length) {
+        let n = 0;
+        const items = lote.items.map(i => {
+          if (i.status === 'pending' || i.status === 'generating') { n++; return { ...i, status: 'cancelled' as const }; }
+          return i;
+        });
+        setCarouselData({ ...lote, items });
+        setInterrompidas(n);
+      }
+      setCarregado(true);
+    });
+  }, []);
+
+  // ---- Salva o lote a cada mudança (com pequeno atraso)
+  useEffect(() => {
+    if (!carregado) return;
+    const t = setTimeout(() => salvarLote(carouselData), 400);
+    return () => clearTimeout(t);
+  }, [carouselData, carregado]);
+
+  const atualizarItem = useCallback((id: string, mudanca: Partial<CarouselItem>) => {
+    setCarouselData(prev => prev ? { ...prev, items: prev.items.map(i => i.id === id ? { ...i, ...mudanca } : i) } : prev);
+  }, []);
 
   const handleSenha = (senha: string) => {
     setSenha(senha);
@@ -35,6 +109,7 @@ const App: React.FC = () => {
   // Senha errada: volta para a tela de acesso. Outros erros aparecem no próprio card.
   const handleAuthError = (error: any) => {
     if (error instanceof ErroServidor && error.codigo === "SENHA") {
+      cancelarTudo();
       limparSenha();
       setHasKey(false);
       setAuthError(error.message);
@@ -43,307 +118,374 @@ const App: React.FC = () => {
     return false;
   };
 
-  useEffect(() => {
-    if (!carouselData) return;
-    const pendingItems = carouselData.items.filter(i => i.status === 'pending');
-    if (pendingItems.length === 0) return;
-    const availableSlots = MAX_CONCURRENT - generatingCount;
-    if (availableSlots <= 0) return;
-    const itemsToStart = pendingItems.slice(0, availableSlots);
-    itemsToStart.forEach(item => processItem(item));
-  }, [carouselData, generatingCount]);
-
   const processItem = async (item: CarouselItem) => {
-    setGeneratingCount(c => c + 1);
-    setCarouselData(prev => {
-      if (!prev) return null;
-      return {
-        ...prev,
-        items: prev.items.map(i => i.id === item.id ? { ...i, status: 'generating' } : i)
-      };
-    });
-
+    const ctrl = new AbortController();
+    controladores.current.set(item.id, ctrl);
+    emAndamento.current.add(item.id);
+    atualizarItem(item.id, { status: 'generating', errorMsg: undefined });
     try {
-      const imageUrl = await generateCarouselImage(item, item.config);
-      setCarouselData(prev => {
-        if (!prev) return null;
-        return {
-          ...prev,
-          items: prev.items.map(i => i.id === item.id ? { ...i, status: 'completed', imageUrl, errorMsg: undefined } : i)
-        };
-      });
+      const imageUrl = await generateCarouselImage(item, item.config, ctrl.signal);
+      atualizarItem(item.id, { status: 'completed', imageUrl, errorMsg: undefined });
     } catch (err: any) {
       if (handleAuthError(err)) return;
-      const errorMsg = err.message || 'Erro de geração';
-      setCarouselData(prev => {
-        if (!prev) return null;
-        return {
-          ...prev,
-          items: prev.items.map(i => i.id === item.id ? { ...i, status: 'error', errorMsg } : i)
-        };
-      });
+      if (err instanceof ErroServidor && err.codigo === 'CANCELADO') {
+        atualizarItem(item.id, { status: 'cancelled' });
+      } else if (err instanceof ErroServidor && err.codigo === 'LIMITE') {
+        // O Google limitou: devolve à fila, reduz o paralelismo e espera um pouco.
+        atualizarItem(item.id, { status: 'pending' });
+        limiteParalelo.current = Math.max(1, Math.floor(limiteParalelo.current / 2));
+        pausadoAte.current = Date.now() + PAUSA_LIMITE_MS;
+        setAviso('O Google limitou o uso. O lote continua mais devagar, sozinho.');
+      } else {
+        atualizarItem(item.id, { status: 'error', errorMsg: err?.message || 'Não foi possível gerar esta imagem.' });
+      }
     } finally {
-      setGeneratingCount(c => c - 1);
+      controladores.current.delete(item.id);
+      emAndamento.current.delete(item.id);
+      forcar(x => x + 1);
     }
   };
 
-  const handleMainAction = async () => {
+  // ---- Despacha a fila
+  useEffect(() => {
+    if (!carouselData) return;
+    const agora = Date.now();
+    if (pausadoAte.current > agora) {
+      if (timerPausa.current === null) {
+        timerPausa.current = window.setTimeout(() => { timerPausa.current = null; forcar(x => x + 1); }, pausadoAte.current - agora + 50);
+      }
+      return;
+    }
+    const livres = limiteParalelo.current - emAndamento.current.size;
+    if (livres <= 0) return;
+    carouselData.items
+      .filter(i => i.status === 'pending' && !emAndamento.current.has(i.id))
+      .slice(0, livres)
+      .forEach(processItem);
+  });
+
+  const cancelarTudo = () => {
+    controladores.current.forEach(c => c.abort());
+    setCarouselData(prev => prev ? { ...prev, items: prev.items.map(i => i.status === 'pending' || i.status === 'generating' ? { ...i, status: 'cancelled' } : i) } : prev);
+  };
+
+  const handleMainAction = () => {
     if (!inputValue.trim()) return;
-    setIsProcessing(true);
-    setAuthError(null);
+    setErroRoteiro(null);
     try {
       const parsed = parseRawList(inputValue);
-      const enrichedItems: CarouselItem[] = parsed.items.map(item => ({
-        ...item,
-        status: 'pending',
-        config: { ...imageConfig } 
-      } as CarouselItem));
-
+      const novos: CarouselItem[] = parsed.items.map(item => ({ ...item, status: 'pending', config: { ...imageConfig } } as CarouselItem));
       setCarouselData(prev => {
-        if (!prev) {
-          return {
-            title: `Pack de ${enrichedItems.length} Imagens`,
-            items: enrichedItems
-          };
-        }
-        return {
-          ...prev,
-          title: `Pack de ${prev.items.length + enrichedItems.length} Imagens`,
-          items: [...prev.items, ...enrichedItems]
-        };
+        const items = prev ? [...prev.items, ...novos] : novos;
+        return { title: `${items.length} ${items.length === 1 ? 'ilustração' : 'ilustrações'}`, items };
       });
       setInputValue('');
+      setInterrompidas(0);
+      limiteParalelo.current = PARALELO_INICIAL;
     } catch (e: any) {
-      alert(e.message);
-    } finally {
-      setIsProcessing(false);
+      setErroRoteiro(e.message);
     }
   };
 
-  const handleRetry = (item: CarouselItem) => {
+  const tituloDo = (items: CarouselItem[]) => `${items.length} ${items.length === 1 ? 'ilustração' : 'ilustrações'}`;
+
+  // Mantém a imagem anterior até a nova ficar pronta: se a nova falhar, nada se perde.
+  const regenerar = (item: CarouselItem, prompt?: string) => atualizarItem(item.id, { status: 'pending', errorMsg: undefined, prompt: prompt ?? item.prompt });
+
+  const variacao = (item: CarouselItem) => {
     setCarouselData(prev => {
-        if (!prev) return null;
-        return {
-          ...prev,
-          items: prev.items.map(i => i.id === item.id ? { ...i, status: 'pending', errorMsg: undefined } : i)
-        };
+      if (!prev) return prev;
+      const idx = prev.items.findIndex(i => i.id === item.id);
+      const base = item.pageLabel.replace(/ · v\d+$/, '');
+      const n = prev.items.filter(i => i.pageLabel === base || i.pageLabel.startsWith(base + ' · v')).length + 1;
+      const novo: CarouselItem = { ...item, id: crypto.randomUUID(), pageLabel: `${base} · v${n}`, status: 'pending', imageUrl: undefined, errorMsg: undefined };
+      const items = [...prev.items.slice(0, idx + 1), novo, ...prev.items.slice(idx + 1)];
+      return { title: tituloDo(items), items };
     });
   };
 
-  const handleDownloadAll = () => {
+  const remover = (item: CarouselItem) => {
+    controladores.current.get(item.id)?.abort();
+    setCarouselData(prev => {
+      if (!prev) return prev;
+      const items = prev.items.filter(i => i.id !== item.id);
+      return items.length ? { title: tituloDo(items), items } : null;
+    });
+  };
+
+  const repetirFalhas = () => setCarouselData(prev => prev ? { ...prev, items: prev.items.map(i => i.status === 'error' || i.status === 'cancelled' ? { ...i, status: 'pending', errorMsg: undefined } : i) } : prev);
+
+  const limparTudo = () => {
+    if (!window.confirm('Apagar todas as ilustrações deste lote? Baixe antes as que quiser guardar.')) return;
+    cancelarTudo();
+    setCarouselData(null);
+    setInterrompidas(0);
+  };
+
+  const baixarZip = async () => {
     if (!carouselData) return;
-    const completed = carouselData.items.filter(i => i.status === 'completed');
-    completed.forEach((item, index) => {
-      setTimeout(() => {
-        const link = document.createElement('a');
-        link.href = item.imageUrl!;
-        const safeLabel = item.pageLabel.replace(/\s+/g, '_').replace(/[()]/g, '');
-        link.download = `${safeLabel}_${item.config.style}_${index}.png`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-      }, index * 800);
-    });
+    setZipando(true);
+    try {
+      const usados = new Map<string, number>();
+      const arquivos = carouselData.items.filter(i => i.status === 'completed' && i.imageUrl).map((item, n) => {
+        const { bytes, mime } = dataUrlParaBytes(item.imageUrl!);
+        const base = `${String(n + 1).padStart(2, '0')}_${item.pageLabel.replace(/[^\p{L}\p{N}]+/gu, '_')}_${item.config.style}`;
+        const k = (usados.get(base) || 0) + 1; usados.set(base, k);
+        return { nome: `${base}${k > 1 ? '_' + k : ''}.${extensaoDoMime(mime)}`, bytes };
+      });
+      const blob = criarZip(arquivos);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ilustracoes_${new Date().toISOString().slice(0, 10)}.zip`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    } finally {
+      setZipando(false);
+    }
   };
 
-  const progress = useMemo(() => {
-    if (!carouselData) return 0;
-    const total = carouselData.items.length;
-    const done = carouselData.items.filter(i => i.status === 'completed' || i.status === 'error').length;
-    return Math.round((done / total) * 100);
+  const escolherReferencia = async (arquivo?: File) => {
+    setErroRef(null);
+    if (!arquivo) return;
+    try {
+      const referencia = await prepararReferencia(arquivo);
+      setImageConfig(c => ({ ...c, referencia }));
+    } catch (e: any) {
+      setErroRef(e.message);
+    }
+  };
+
+  const copiarModelo = async () => {
+    try { await navigator.clipboard.writeText(AI_INSTRUCTION_MODEL); setAviso('Instrução copiada. Cole no ChatGPT ou no Gemini.'); }
+    catch { setAviso('Não foi possível copiar. Selecione o texto e copie à mão.'); }
+  };
+
+  useEffect(() => {
+    if (!aviso) return;
+    const t = setTimeout(() => setAviso(null), 5000);
+    return () => clearTimeout(t);
+  }, [aviso]);
+
+  const contagem = useMemo(() => {
+    const items = carouselData?.items || [];
+    const c = { total: items.length, prontas: 0, gerando: 0, fila: 0, falhas: 0, paradas: 0 };
+    items.forEach(i => {
+      if (i.status === 'completed') c.prontas++;
+      else if (i.status === 'generating') c.gerando++;
+      else if (i.status === 'pending') c.fila++;
+      else if (i.status === 'error') c.falhas++;
+      else if (i.status === 'cancelled') c.paradas++;
+    });
+    return c;
   }, [carouselData]);
 
-  const aspectRatios: { id: AspectRatioType; label: string; icon: string }[] = [
-    { id: "1:1", label: "Quadrado (Feed)", icon: "M5 5h14v14H5z" },
-    { id: "4:5", label: "Retrato (Feed)", icon: "M6 4h12v16H6z" },
-    { id: "9:16", label: "Stories / Reels", icon: "M8 2h8v20H8z" },
-    { id: "16:9", label: "Widescreen", icon: "M2 7h20v10H2z" }
-  ];
+  const progresso = contagem.total ? Math.round(((contagem.prontas + contagem.falhas + contagem.paradas) / contagem.total) * 100) : 0;
+  const ativo = contagem.gerando + contagem.fila > 0;
+  const blocosNoRoteiro = useMemo(() => {
+    if (!inputValue.trim()) return 0;
+    try { return parseRawList(inputValue).items.length; } catch { return 0; }
+  }, [inputValue]);
 
-  const handleCopyModel = () => {
-    navigator.clipboard.writeText(AI_INSTRUCTION_MODEL);
-    alert("Instrução copiada!");
-  };
-
-  // Renderiza a tela de bloqueio apenas se NÃO houver chave detectada
   if (!hasKey) {
     return <ApiKeyModal onSubmit={handleSenha} error={authError} />;
   }
 
+  const estiloAtual = STYLES[imageConfig.style];
+  const grupos: { id: 'estudo' | 'geral'; titulo: string }[] = [
+    { id: 'estudo', titulo: 'Para estudo (testados)' },
+    { id: 'geral', titulo: 'Gerais' },
+  ];
+
+  const opcao = (sel: boolean) =>
+    `w-full text-left rounded-p border px-3 py-2 min-h-alvo transition-colors ${sel ? 'border-primaria bg-primaria-suave' : 'border-linha bg-superficie hover:border-linha-forte'}`;
+
   return (
-    <div className="min-h-screen bg-[#0F1115] text-white pb-20 font-inter selection:bg-brand-blue/30">
-      <header className="sticky top-0 z-30 bg-[#0F1115]/80 backdrop-blur-md border-b border-gray-800">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2 cursor-pointer" onClick={() => setCarouselData(null)}>
-             <div className="w-9 h-9 bg-gradient-to-br from-brand-orange to-brand-blue rounded-xl flex items-center justify-center font-bold text-white shadow-lg shadow-brand-blue/20">
-               L
-             </div>
-             <h1 className="font-bold text-xl tracking-tight">
-               <span className="text-white">Lote</span>
-               <span className="text-brand-blue">Markdown</span>
-             </h1>
+    <div className="min-h-screen bg-fundo text-texto">
+      <a className="av-pular" href="#roteiro">Pular para o roteiro</a>
+      <header className="av-cabecalho">
+        <div className="max-w-[1320px] mx-auto px-4 sm:px-6 min-h-16 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <span className="av-marca-simbolo" aria-hidden="true"></span>
+            <h1 className="font-bold text-base sm:text-lg leading-tight">Criador de Ilustrações</h1>
           </div>
-          <div className="flex items-center gap-4">
-             <button onClick={() => setShowModelModal(true)} className="text-[10px] font-black uppercase tracking-widest text-gray-400 hover:text-brand-blue transition-colors px-3 py-1.5 border border-gray-800 rounded-full hover:border-brand-blue/40">
-               Modelo para IA
-             </button>
-             <div className="px-3 py-1.5 rounded-full bg-gray-900 border border-gray-800 text-[10px] font-bold text-gray-400 flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full animate-pulse ${imageConfig.resolution === 'Flash' ? 'bg-yellow-500' : 'bg-green-500'}`}></div>
-                {generatingCount > 0 ? `GERANDO ${generatingCount} EM PARALELO` : (imageConfig.resolution === 'Flash' ? 'PRONTO (FLASH)' : 'PRONTO (PRO)')}
-             </div>
+          <div className="flex items-center gap-2">
+            <span className="hidden sm:inline-flex items-center gap-2 text-sm text-texto-suave" aria-live="polite">
+              <span className={`w-2 h-2 rounded-full ${ativo ? 'bg-primaria' : 'bg-sucesso'}`} aria-hidden="true"></span>
+              {ativo ? `Gerando ${contagem.gerando} de ${contagem.gerando + contagem.fila}` : 'Pronto'}
+            </span>
+            <button type="button" onClick={() => setShowModelModal(true)} className="av-btn av-btn--fantasma av-btn--pequeno">
+              <span className="sm:hidden">Instrução</span><span className="hidden sm:inline">Instrução para a IA</span>
+            </button>
+            <button type="button" onClick={() => setTema(t => t === 'dark' ? 'light' : 'dark')} aria-pressed={tema === 'light'} className="av-btn av-btn--fantasma av-btn--pequeno">
+              <span className="sm:hidden">{tema === 'dark' ? 'Claro' : 'Escuro'}</span>
+              <span className="hidden sm:inline">{tema === 'dark' ? 'Tema claro' : 'Tema escuro'}</span>
+            </button>
           </div>
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
-        {!carouselData && (
-          <div className="text-center mb-12 py-10 animate-in fade-in slide-in-from-bottom-4 duration-700">
-            <h2 className="text-4xl md:text-6xl font-black mb-4 bg-clip-text text-transparent bg-gradient-to-r from-white via-white to-gray-500">
-              Criação Simultânea <br/>por Roteiro
-            </h2>
-            <p className="text-gray-400 max-w-xl mx-auto text-lg">
-              O sistema gera todas as imagens de uma vez. Adicione seus blocos e veja a mágica acontecer em paralelo.
-            </p>
-          </div>
-        )}
+      <main className="max-w-[1320px] mx-auto px-4 sm:px-6 py-6 lg:py-8 grid gap-6 lg:grid-cols-[340px_minmax(0,1fr)] lg:grid-rows-[auto_1fr] items-start">
+        {/* Configurações: sempre visíveis */}
+        <aside className="order-2 lg:order-none lg:col-start-1 lg:row-start-1 lg:row-span-2 lg:sticky lg:top-24 bg-superficie border border-linha rounded-m p-4 sm:p-5 space-y-6 lg:max-h-[calc(100vh-7rem)] lg:overflow-y-auto" aria-labelledby="config-titulo">
+          <h2 id="config-titulo" className="text-lg font-bold">Configurações do lote</h2>
 
-        <div className="max-w-3xl mx-auto w-full mb-12">
-          <div className="bg-[#1A1D24] p-4 rounded-3xl border border-gray-800 shadow-2xl transition-all hover:border-brand-blue/30 relative">
-            <textarea 
-              value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
-              placeholder="Cole seu roteiro Markdown aqui...&#10;&#10;**P1**&#10;Descrição 1...&#10;---&#10;**P2**&#10;Descrição 2..."
-              className="w-full bg-transparent text-gray-200 p-4 min-h-[150px] outline-none resize-none text-base font-medium placeholder:text-gray-600 custom-scrollbar"
-            />
-            
-            <div className="flex flex-wrap justify-between items-center px-4 py-3 border-t border-gray-800/50 mt-4 gap-4">
-              <div className="flex gap-2">
-                <button 
-                  onClick={() => setShowSettings(!showSettings)} 
-                  className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 border transition-all ${showSettings ? 'bg-brand-blue border-brand-blue text-white' : 'bg-gray-900/50 hover:bg-gray-800 border-gray-800 text-gray-300'}`}
-                >
-                  ⚙️ Configurações do Lote
+          <fieldset className="space-y-2">
+            <legend className="text-sm font-semibold mb-2">Estilo</legend>
+            {grupos.map(g => (
+              <div key={g.id}>
+                <p className="text-xs text-texto-suave pt-1 mb-2">{g.titulo}</p>
+                <div className="grid grid-cols-2 lg:grid-cols-1 gap-2">
+                {Object.entries(STYLES).filter(([, s]) => s.grupo === g.id).map(([key, s]) => (
+                  <button key={key} type="button" aria-pressed={imageConfig.style === key}
+                    onClick={() => setImageConfig({ ...imageConfig, style: key as ImageStyleId })} className={`${opcao(imageConfig.style === key)} flex flex-col lg:flex-row items-start lg:items-center gap-2 lg:gap-3`}>
+                    {/* Miniatura: a mesma cena gerada neste estilo (public/estilos) */}
+                    <img src={`/estilos/${key}.webp`} alt="" width={256} height={256} loading="lazy" className="w-full lg:w-14 aspect-square lg:h-14 rounded-p object-cover shrink-0 bg-superficie-2" />
+                    <span className="min-w-0">
+                      <span className="block text-sm font-semibold">{s.label}</span>
+                      <span className="block text-xs text-texto-suave">{s.descricao}</span>
+                    </span>
+                  </button>
+                ))}
+                </div>
+              </div>
+            ))}
+          </fieldset>
+
+          <fieldset>
+            <legend className="text-sm font-semibold mb-2">Proporção</legend>
+            <div className="grid grid-cols-2 gap-2">
+              {proporcoes.map(p => (
+                <button key={p.id} type="button" aria-pressed={imageConfig.aspectRatio === p.id}
+                  onClick={() => setImageConfig({ ...imageConfig, aspectRatio: p.id })} className={`${opcao(imageConfig.aspectRatio === p.id)} flex items-center gap-2`}>
+                  <span aria-hidden="true" className="border-2 border-current rounded-sm shrink-0 text-primaria" style={{ width: 18 * p.w / Math.max(p.w, p.h), height: 18 * p.h / Math.max(p.w, p.h) }}></span>
+                  <span className="text-sm font-semibold leading-tight">{p.label}</span>
                 </button>
-              </div>
-
-              <button 
-                onClick={handleMainAction} 
-                disabled={isProcessing || !inputValue.trim()} 
-                className="bg-brand-blue hover:bg-blue-500 text-white font-black px-8 py-3 rounded-2xl text-sm transition-all shadow-lg shadow-brand-blue/20 disabled:opacity-50 active:scale-95"
-              >
-                {isProcessing ? 'Adicionando...' : 'Adicionar e Gerar em Lote'}
-              </button>
-            </div>
-
-            {showSettings && (
-              <div className="absolute top-full left-0 right-0 mt-3 bg-[#1A1D24] border border-gray-700 rounded-3xl p-6 z-40 shadow-2xl animate-in fade-in zoom-in-95 grid grid-cols-1 md:grid-cols-3 gap-6">
-                <div>
-                  <h4 className="text-[10px] font-black text-gray-500 uppercase tracking-widest mb-3">Estilo</h4>
-                  <div className="space-y-1 max-h-48 overflow-y-auto pr-2 custom-scrollbar">
-                    {Object.entries(STYLES).map(([key, s]) => (
-                      <button 
-                        key={key} 
-                        onClick={() => setImageConfig({...imageConfig, style: key as ImageStyleId})}
-                        className={`w-full flex items-center gap-3 p-2 rounded-lg text-left transition-all ${imageConfig.style === key ? 'bg-brand-blue/20 border-brand-blue/40' : 'hover:bg-gray-800 border-transparent'} border`}
-                      >
-                        <img src={s.thumbnail} className="w-8 h-8 rounded-md object-cover" />
-                        <span className="text-xs font-bold truncate">{s.label}</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div>
-                  <h4 className="text-[10px] font-black text-gray-500 uppercase tracking-widest mb-3">Proporção</h4>
-                  <div className="space-y-1">
-                    {aspectRatios.map(ratio => (
-                      <button 
-                        key={ratio.id} 
-                        onClick={() => setImageConfig({...imageConfig, aspectRatio: ratio.id})}
-                        className={`w-full flex items-center gap-3 p-3 rounded-lg text-left transition-all ${imageConfig.aspectRatio === ratio.id ? 'bg-brand-blue/20 border-brand-blue/40' : 'hover:bg-gray-800 border-transparent'} border`}
-                      >
-                        <svg className="w-5 h-5 text-brand-blue" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                          <path strokeLinecap="round" strokeLinejoin="round" d={ratio.icon} />
-                        </svg>
-                        <p className="text-xs font-bold">{ratio.label}</p>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div>
-                  <h4 className="text-[10px] font-black text-gray-500 uppercase tracking-widest mb-3">Qualidade</h4>
-                  <div className="space-y-2">
-                    {[
-                      {id: 'Flash', label: 'Flash (Instantâneo)'},
-                      {id: '1K', label: 'Pro 1K (Padrão)'},
-                      {id: '2K', label: 'Pro 2K (Ultra)'}
-                    ].map(res => (
-                      <button 
-                        key={res.id} 
-                        onClick={() => setImageConfig({...imageConfig, resolution: res.id as any})}
-                        className={`w-full p-3 rounded-lg text-left transition-all ${imageConfig.resolution === res.id ? 'bg-brand-blue/20 border-brand-blue/40' : 'hover:bg-gray-800 border-transparent'} border`}
-                      >
-                        <p className="text-xs font-bold">{res.label}</p>
-                      </button>
-                    ))}
-                  </div>
-                  <button onClick={() => setShowSettings(false)} className="w-full mt-6 bg-white text-black py-2.5 text-xs font-black rounded-xl hover:bg-gray-200 transition-colors">Fechar</button>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-
-        {carouselData && (
-          <div className="space-y-8 animate-in fade-in duration-500">
-            <div className="bg-[#1A1D24] border border-gray-800 rounded-3xl p-6 flex flex-col md:flex-row md:items-center justify-between gap-6 shadow-xl">
-              <div className="flex-1">
-                <h3 className="text-2xl font-black mb-1">{carouselData.title}</h3>
-                <div className="flex items-center gap-4">
-                  <div className="flex-1 max-w-md h-2 bg-gray-900 rounded-full overflow-hidden border border-gray-800">
-                    <div className="h-full bg-gradient-to-r from-brand-orange to-brand-blue transition-all duration-500" style={{ width: `${progress}%` }}></div>
-                  </div>
-                  <span className="text-[10px] font-black text-brand-blue uppercase tracking-widest">{progress}% concluído</span>
-                </div>
-              </div>
-              <div className="flex items-center gap-3">
-                <button 
-                  onClick={handleDownloadAll} 
-                  disabled={!carouselData.items.some(i => i.status === 'completed')} 
-                  className="px-6 py-3 bg-white text-black text-sm font-black rounded-2xl hover:bg-gray-200 disabled:opacity-30 active:scale-95 transition-all shadow-lg"
-                >
-                  Baixar Pack Completo
-                </button>
-                <button 
-                  onClick={() => setCarouselData(null)} 
-                  className="p-3 bg-gray-800 hover:bg-gray-700 rounded-2xl border border-gray-700 transition-colors"
-                >
-                  Limpar Tudo
-                </button>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
-              {carouselData.items.map(item => (
-                <CardDisplay key={item.id} item={item} onRetry={handleRetry} />
               ))}
             </div>
-          </div>
-        )}
+          </fieldset>
+
+          <fieldset>
+            <legend className="text-sm font-semibold mb-2">Qualidade</legend>
+            <div className="grid grid-cols-3 gap-2">
+              {qualidades.map(q => (
+                <button key={q.id} type="button" aria-pressed={imageConfig.resolution === q.id}
+                  onClick={() => setImageConfig({ ...imageConfig, resolution: q.id })} className={opcao(imageConfig.resolution === q.id)}>
+                  <span className="block text-sm font-semibold">{q.label}</span>
+                  <span className="block text-xs text-texto-suave">{q.descricao}</span>
+                </button>
+              ))}
+            </div>
+          </fieldset>
+
+          <fieldset>
+            <legend className="text-sm font-semibold mb-1">Imagem de referência</legend>
+            <p className="text-xs text-texto-suave mb-2">Opcional. Um personagem ou uma arte para manter o mesmo visual em todo o lote.</p>
+            {imageConfig.referencia ? (
+              <div className="flex items-center gap-3">
+                <img src={imageConfig.referencia} alt="Imagem de referência escolhida" className="w-16 h-16 object-cover rounded-p border border-linha" />
+                <button type="button" className="av-btn av-btn--fantasma av-btn--pequeno" onClick={() => setImageConfig(c => ({ ...c, referencia: undefined }))}>Remover referência</button>
+              </div>
+            ) : (
+              <label className="av-btn av-btn--fantasma av-btn--pequeno cursor-pointer w-full">
+                Escolher imagem
+                <input type="file" accept="image/png,image/jpeg,image/webp" className="sr-only" onChange={e => { escolherReferencia(e.target.files?.[0]); e.currentTarget.value = ''; }} />
+              </label>
+            )}
+            {erroRef && <p className="text-sm text-erro font-semibold mt-2">{erroRef}</p>}
+          </fieldset>
+        </aside>
+
+          {/* Roteiro */}
+          <section className="order-1 lg:order-none lg:col-start-2 lg:row-start-1 min-w-0 bg-superficie border border-linha rounded-m p-4 sm:p-5" aria-labelledby="roteiro-titulo">
+            <h2 id="roteiro-titulo" className="text-lg font-bold mb-1">Roteiro</h2>
+            <p className="text-sm text-texto-suave mb-3">Cada bloco vira uma imagem. Marque os blocos com **P1**, **P2** e separe com ---.</p>
+            <label htmlFor="roteiro" className="sr-only">Roteiro em Markdown</label>
+            <textarea
+              id="roteiro"
+              value={inputValue}
+              onChange={e => { setInputValue(e.target.value); setErroRoteiro(null); }}
+              onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) handleMainAction(); }}
+              aria-invalid={!!erroRoteiro}
+              aria-describedby="roteiro-ajuda"
+              placeholder={'**P1**\nServidor lendo um ofício com uma lupa\n---\n**P2**\nMapa mental da Lei 8.112 numa lousa'}
+              className="w-full min-h-[180px] rounded-p border-2 border-linha-forte bg-fundo text-texto p-3 text-base resize-y focus:border-primaria"
+            />
+            {erroRoteiro && <p className="text-sm text-erro font-semibold mt-2" role="alert">{erroRoteiro}</p>}
+            <div className="flex flex-wrap items-center justify-between gap-3 mt-3">
+              <p id="roteiro-ajuda" className="text-sm text-texto-suave">
+                {estiloAtual.label} · {proporcoes.find(p => p.id === imageConfig.aspectRatio)?.label} · {qualidades.find(q => q.id === imageConfig.resolution)?.label}
+                {imageConfig.referencia ? ' · com referência' : ''}. Ctrl + Enter também gera.
+              </p>
+              <button type="button" onClick={handleMainAction} disabled={!blocosNoRoteiro} className="av-btn av-btn--primario w-full sm:w-auto">
+                {blocosNoRoteiro ? `Gerar ${blocosNoRoteiro} ${blocosNoRoteiro === 1 ? 'ilustração' : 'ilustrações'}` : 'Gerar ilustrações'}
+              </button>
+            </div>
+          </section>
+
+        <div className="order-3 lg:order-none lg:col-start-2 lg:row-start-2 space-y-6 min-w-0">
+          {interrompidas > 0 && (
+            <div className="av-aviso av-aviso--atencao" role="status">
+              <span className="av-aviso-icone" aria-hidden="true">!</span>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div><strong>{interrompidas} {interrompidas === 1 ? 'imagem não terminou' : 'imagens não terminaram'}</strong>A página foi recarregada no meio do lote.</div>
+                <button type="button" className="av-btn av-btn--secundario av-btn--pequeno" onClick={() => { repetirFalhas(); setInterrompidas(0); }}>Retomar o lote</button>
+              </div>
+            </div>
+          )}
+
+          {carouselData ? (
+            <section className="space-y-5" aria-labelledby="lote-titulo">
+              <div className="bg-superficie border border-linha rounded-m p-4 sm:p-5 flex flex-col xl:flex-row xl:items-center justify-between gap-4">
+                <div className="flex-1 min-w-0">
+                  <h2 id="lote-titulo" className="text-xl font-bold mb-2">{carouselData.title}</h2>
+                  <div className="av-progresso max-w-md">
+                    <div className="av-progresso-trilho"><div className="av-progresso-barra" style={{ width: `${progresso}%` }}></div></div>
+                    <span className="av-progresso-rotulo">{contagem.prontas} prontas{contagem.falhas ? ` · ${contagem.falhas} com erro` : ''}{contagem.paradas ? ` · ${contagem.paradas} ${contagem.paradas === 1 ? 'parada' : 'paradas'}` : ''}</span>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {ativo && <button type="button" onClick={cancelarTudo} className="av-btn av-btn--secundario av-btn--pequeno">Parar o lote</button>}
+                  {!ativo && (contagem.falhas + contagem.paradas > 0) && <button type="button" onClick={repetirFalhas} className="av-btn av-btn--secundario av-btn--pequeno">Repetir as {contagem.falhas + contagem.paradas} que faltam</button>}
+                  <button type="button" onClick={baixarZip} disabled={!contagem.prontas || zipando} className="av-btn av-btn--primario av-btn--pequeno">
+                    {zipando ? 'Preparando o .zip…' : `Baixar ${contagem.prontas} em .zip`}
+                  </button>
+                  <button type="button" onClick={limparTudo} className="av-btn av-btn--fantasma av-btn--pequeno">Apagar o lote</button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 2xl:grid-cols-3 gap-5">
+                {carouselData.items.map(item => (
+                  <CardDisplay key={item.id} item={item} onRetry={i => regenerar(i)} onEdit={(i, p) => regenerar(i, p)} onVariation={variacao} onRemove={remover} />
+                ))}
+              </div>
+            </section>
+          ) : carregado && (
+            <section className="border-2 border-dashed border-linha rounded-m p-6 sm:p-8">
+              <h2 className="text-xl font-bold mb-2">Nenhuma ilustração ainda</h2>
+              <p className="text-texto-suave max-w-prose">Cole o roteiro acima e escolha o estilo ao lado. Se ainda não tem roteiro, copie a instrução para a IA e peça ao ChatGPT ou ao Gemini para montar um sobre o seu tema.</p>
+              <button type="button" className="av-btn av-btn--secundario av-btn--pequeno mt-4" onClick={() => setShowModelModal(true)}>Ver a instrução para a IA</button>
+            </section>
+          )}
+        </div>
       </main>
 
+      {aviso && (
+        <div role="status" className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 bg-superficie-2 text-texto border border-linha rounded-m shadow-2 px-4 py-3 text-sm font-semibold max-w-[90vw]">
+          {aviso}
+        </div>
+      )}
+
       {showModelModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 animate-in fade-in duration-300">
-          <div className="bg-[#1A1D24] border border-gray-800 rounded-3xl p-8 max-w-lg w-full shadow-2xl">
-            <h3 className="text-xl font-black mb-4">Instrução para sua IA</h3>
-            <p className="text-gray-400 text-xs mb-4">Copie e cole este prompt no ChatGPT ou Gemini para gerar o roteiro compatível com este sistema.</p>
-            <div className="bg-black/40 rounded-2xl p-4 text-[11px] font-mono text-gray-300 border border-white/5 mb-6 max-h-[300px] overflow-y-auto custom-scrollbar">
-              {AI_INSTRUCTION_MODEL}
-            </div>
-            <div className="flex gap-4">
-              <button onClick={handleCopyModel} className="flex-1 bg-brand-blue py-3 rounded-xl font-black text-sm hover:bg-blue-500 transition-colors shadow-lg shadow-brand-blue/20">Copiar Prompt</button>
-              <button onClick={() => setShowModelModal(false)} className="px-6 bg-gray-800 py-3 rounded-xl font-black text-sm hover:bg-gray-700 transition-colors">Fechar</button>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={() => setShowModelModal(false)}>
+          <div role="dialog" aria-modal="true" aria-labelledby="modelo-titulo" className="bg-superficie border border-linha rounded-g p-6 max-w-lg w-full shadow-2"
+            onClick={e => e.stopPropagation()} onKeyDown={e => { if (e.key === 'Escape') setShowModelModal(false); }}>
+            <h3 id="modelo-titulo" className="text-xl font-bold mb-2">Instrução para a sua IA</h3>
+            <p className="text-texto-suave text-sm mb-4">Cole no ChatGPT ou no Gemini junto com o tema. A resposta já vem no formato do roteiro.</p>
+            <pre className="bg-fundo rounded-m p-4 text-sm text-texto border border-linha mb-5 max-h-[300px] overflow-y-auto whitespace-pre-wrap font-sans">{AI_INSTRUCTION_MODEL.trim()}</pre>
+            <div className="flex gap-3">
+              <button type="button" autoFocus onClick={copiarModelo} className="av-btn av-btn--primario flex-1">Copiar a instrução</button>
+              <button type="button" onClick={() => setShowModelModal(false)} className="av-btn av-btn--fantasma">Fechar</button>
             </div>
           </div>
         </div>
