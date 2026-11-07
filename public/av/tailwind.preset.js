@@ -4,7 +4,7 @@
  * troca sozinho pelo atributo <html data-theme="...">. Carregue tokens.css antes.
  *
  * Projeto com build (Vite):   presets: [require('./tailwind.preset.js')]
- * Tailwind pelo CDN:           tailwind.config = { presets: [avPreset] }  (cole o objeto abaixo num <script>)
+ * Tailwind pelo CDN: carregue o CDN, depois este arquivo, depois <script>tailwind.config = window.avPreset;</script> (o CDN ignora "presets")
  *
  * Transparência: use os tokens "-suave" (bg-primaria-suave) em vez de bg-primaria/20,
  * porque cor em var() não aceita o modificador de opacidade.
